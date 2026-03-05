@@ -1,0 +1,160 @@
+---
+title: "Ancestry-Aware PRS with genoformerR (v0.2)"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Ancestry-Aware PRS with genoformerR}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, echo = TRUE)
+```
+
+## What's new in v0.2
+
+v0.2 adds **local ancestry conditioning** for admixed cohorts:
+
+| Feature | v0.1 | v0.2 |
+|---|---|---|
+| Global ancestry (FiLM) | ✅ | ✅ |
+| Per-SNP local ancestry embedding | ❌ | ✅ (RFMix2) |
+| Haplotype phasing wrapper | ❌ | ✅ (SHAPEIT4) |
+| Graceful global-only fallback | ✅ | ✅ |
+| `GenoFormerPhased` (bi-haplotype) | ❌ | ✅ (experimental) |
+
+## Quick start — global-only (no phasing required)
+
+```r
+library(genoformerR)
+gf_init()
+
+results <- gf_run_pipeline(
+  dosage_raw = "data/plink/kg3_pgs_dosage.raw",
+  pgs_file   = "PGS000018.txt.gz",
+  panel_file = "data/1kg/integrated_call_samples_v3.20130502.ALL.panel",
+  phenotype  = pheno_vec,
+  outdir     = "results/global_only"
+  # run_local_anc = FALSE is the default
+)
+```
+
+## Full dual-level pipeline (recommended for AMR/admixed cohorts)
+
+```r
+library(genoformerR)
+gf_init()
+
+results <- gf_run_pipeline(
+  dosage_raw       = "data/plink/kg3_pgs_dosage.raw",
+  pgs_file         = "PGS000018.txt.gz",
+  panel_file       = "data/1kg/integrated_call_samples_v3.20130502.ALL.panel",
+  phenotype        = pheno_vec,
+  outdir           = "results/dual_prs",
+  # Local ancestry options
+  run_phasing      = TRUE,                  # runs SHAPEIT4
+  run_local_anc    = TRUE,                  # runs RFMix2
+  gmap_dir         = "data/genetic_maps",
+  ref_vcf          = "data/1kg/kg3_phased.vcf.gz",
+  rfmix_sample_map = "data/rfmix_sample_map.txt",
+  k_pops           = 5L,                    # K reference pops in RFMix2
+  model_config     = list(d_model = 256, n_layers = 6, d_local = 64),
+  train_config     = list(epochs = 100, batch_size = 64)
+)
+
+# Portability plot
+results$evaluation$portability_plot
+
+# Local ancestry summary across chromosomes
+summary_tbl <- gf_local_anc_summary(
+  results$local_anc_arr,
+  snp_chroms  = chroms_snp,
+  pop_labels  = results$ancestry$labels
+)
+```
+
+## Step-by-step: local ancestry only
+
+If you already have phased VCFs (e.g. UK Biobank post-phasing):
+
+```r
+gf_init()
+
+# Step 1: Run RFMix2 on pre-phased VCFs
+rfmix_out <- gf_local_ancestry(
+  phased_vcfs  = c("1" = "chr1_phased.vcf.gz", "2" = "chr2_phased.vcf.gz"),
+  ref_vcf      = "kg3_phased.vcf.gz",
+  sample_map   = "rfmix_sample_map.txt",
+  outdir       = "rfmix_output",
+  gmap_dir     = "genetic_maps",
+  k_pops       = 5L
+)
+
+# Step 2: Load and align posteriors to your SNP order
+local_anc_arr <- gf_load_local_anc(
+  rfmix_prefixes    = rfmix_out,
+  snp_ids           = colnames(dosage_mat),
+  snp_positions     = snp_pos,
+  snp_chroms        = snp_chr,
+  sample_ids        = rownames(dosage_mat),
+  global_anc        = anc$anc_probs,    # fallback for non-admixed samples
+  entropy_threshold = 0.3               # samples below this use global anc
+)
+
+dim(local_anc_arr)  # N_samples × N_snps × K_pops
+```
+
+## Architecture notes
+
+### Why local ancestry in the token, not the block?
+
+Global ancestry is a single vector per individual — it makes sense to broadcast
+it to every block via FiLM. Local ancestry is a *sequence* (one K-vector per SNP
+position), so it must be incorporated at the token level before attention
+computes position-to-position interactions. This ordering means attention heads
+can learn ancestry-stratified LD: a head attending from a EUR-tagged SNP to
+another EUR-tagged SNP can up-weight that interaction relative to a cross-ancestry
+pair.
+
+### Entropy-based fallback
+
+For samples with low admixture entropy (< `entropy_threshold`), local ancestry
+inference is unreliable — RFMix2 switches rapidly between ancestry states due
+to noise rather than real mosaic structure. The fallback broadcasts their global
+ancestry vector across all SNP positions, which is functionally equivalent to
+v0.1 behaviour for those samples. Admixed samples (AMR, African American, etc.)
+with high entropy receive full local ancestry conditioning.
+
+### `GenoFormerPhased` (experimental)
+
+For datasets where phased haplotypes are available and per-haplotype RFMix2
+posteriors have been computed, `GenoFormerPhased` processes hap0 and hap1
+through shared model weights and sums their PRS contributions. This is strictly
+more informative than diploid averaging and captures phase-dependent effects,
+but doubles memory consumption. Use via Python directly from `model.py`.
+
+## RFMix2 sample map format
+
+The `rfmix_sample_map` file is a headerless 2-column TSV: reference sample ID
+and population label. Only reference panel samples (not study samples) should
+appear here.
+
+```
+HG00096    EUR
+HG00171    EUR
+HG01880    AFR
+NA19701    AMR
+...
+```
+
+Population labels should match those you want K to represent. For a Latino
+cohort, typical K=3: `EUR`, `AFR`, `NAT` (Native American proxy from 1KGP3
+PEL/MXL).
+
+## References
+
+- Maples et al. (2013) *AJHG* — RFMix algorithm
+- Cabreros et al. (2023) — RFMix2
+- Delaneau et al. (2019) *Nature Communications* — SHAPEIT4
+- Martin et al. (2019) *Nature Genetics* — PRS portability
+- Ruan et al. (2022) *Nature Medicine* — multi-ancestry PRSice

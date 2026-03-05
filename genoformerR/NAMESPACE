@@ -1,0 +1,24 @@
+exportPattern("^gf_")
+export(plot.gf_ancestry)
+export(print.gf_ancestry)
+export(print.gf_model)
+export(print.gf_eval)
+import(reticulate)
+importFrom(data.table, fread, fwrite)
+importFrom(ggplot2, ggplot, aes, geom_point, geom_line, geom_density,
+           geom_errorbar, geom_hline, facet_wrap,
+           scale_colour_manual, scale_fill_manual, scale_y_continuous,
+           labs, theme_minimal, theme, element_rect, element_text,
+           element_line, ggsave)
+importFrom(dplyr, mutate, filter, bind_cols)
+importFrom(tibble, tibble)
+importFrom(cli, cli_h1, cli_alert_info, cli_alert_success, cli_alert_danger,
+           cli_warn, cli_abort, cli_dl, cli_progress_bar, cli_progress_update,
+           cli_progress_done)
+importFrom(glue, glue)
+importFrom(fs, dir_create, dir_ls)
+importFrom(jsonlite, write_json, read_json)
+importFrom(scales, percent_format)
+importFrom(stats, prcomp, predict, cor, quantile, scale, ave)
+importFrom(parallel, makeCluster, stopCluster, parLapply, detectCores)
+importFrom(utils, download.file)
