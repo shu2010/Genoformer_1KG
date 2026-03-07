@@ -78,7 +78,13 @@ gf_predict <- function(model,
   pb <- cli::cli_progress_bar("Inference", total = length(batches))
   for (batch_idx in batches) {
     to_t <- function(x, dtype = "float32") {
-      torch$tensor(reticulate::r_to_py(x), dtype = torch[[dtype]])$to(dev)
+      py_dtype <- switch(dtype,
+        "float32" = torch$float32,
+        "float64" = torch$float64,
+        "int64"   = torch$int64,
+        torch$float32
+      )
+      torch$tensor(reticulate::r_to_py(x), dtype = py_dtype)$to(dev)
     }
     d      <- to_t(dosage_mat[batch_idx, ])
     lb     <- to_t(matrix(log_beta,  nrow = length(batch_idx), ncol = M, byrow = TRUE))

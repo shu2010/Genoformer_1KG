@@ -1,18 +1,18 @@
 Package: genoformerR
 Type: Package
 Title: Ancestry-Aware Polygenic Risk Scoring via Transformer (GenoFormer)
-Version: 0.2.0
+Version: 0.3.1
 Authors@R: person("Shu", role = c("aut", "cre"),
            email = "user@example.com")
 Description: R wrapper for GenoFormer — a transformer-based ancestry-aware
     polygenic risk scoring pipeline using 1000 Genomes Phase 3 as ancestry
-    reference. Provides functions for genotype QC, haplotype phasing (SHAPEIT4),
-    local ancestry inference (RFMix2), per-SNP local ancestry conditioning in the
-    transformer, global ancestry inference via PCA, model training and inference,
-    PRS computation, and cross-ancestry portability evaluation. Handles admixed
-    cohorts via dual-level conditioning: global ancestry (FiLM per block) and
-    local ancestry (per-SNP token embedding). Python backend (PyTorch) is managed
-    via reticulate.
+    reference. v0.3 provides a unified local ancestry dispatcher supporting
+    FLARE (Java, no pre-phasing required, recommended), RFMix2 (legacy,
+    requires SHAPEIT4 pre-phasing), and windowed PCA (pure R, no external
+    tools or reference panel). All methods produce a (N x M x K) per-SNP
+    posterior array for dual-level transformer conditioning: local ancestry
+    fused into each SNP token, global ancestry via FiLM at every block.
+    Python backend (PyTorch) managed via reticulate.
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true

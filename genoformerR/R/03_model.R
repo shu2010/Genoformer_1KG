@@ -46,6 +46,18 @@ gf_build_model <- function(n_snps        = 80000L,
                             use_local_anc = TRUE,
                             dropout       = 0.1,
                             device        = "auto") {
+  # Coerce all args — guards against list-typed values from jsonlite::read_json()
+  n_snps        <- as.integer(n_snps)
+  n_ld_blocks   <- as.integer(n_ld_blocks)
+  d_model       <- as.integer(d_model)
+  n_heads       <- as.integer(n_heads)
+  n_layers      <- as.integer(n_layers)
+  anc_dim       <- as.integer(anc_dim)
+  k_pops        <- as.integer(k_pops)
+  d_local       <- as.integer(d_local)
+  dropout       <- as.numeric(dropout)
+  use_local_anc <- isTRUE(as.logical(use_local_anc))
+
   .check_init()
   device <- .resolve_device(device)
   cli::cli_alert_info("Building GenoFormer v0.2 on {.val {device}} ...")
@@ -58,26 +70,28 @@ gf_build_model <- function(n_snps        = 80000L,
   main  <- reticulate::import_main()
 
   model_py <- main$GenoFormer(
-    n_snps        = as.integer(n_snps),
-    n_ld_blocks   = as.integer(n_ld_blocks),
-    d_model       = as.integer(d_model),
-    n_heads       = as.integer(n_heads),
-    n_layers      = as.integer(n_layers),
-    anc_dim       = as.integer(anc_dim),
-    k_pops        = as.integer(k_pops),
-    d_local       = as.integer(d_local),
+    n_snps        = n_snps,
+    n_ld_blocks   = n_ld_blocks,
+    d_model       = d_model,
+    n_heads       = n_heads,
+    n_layers      = n_layers,
+    anc_dim       = anc_dim,
+    k_pops        = k_pops,
+    d_local       = d_local,
     dropout       = dropout,
     use_local_anc = use_local_anc
   )
   model_py <- model_py$to(device)
 
+  # Assign model into Python main namespace so py_eval can see it,
+  # then clean up afterwards
+  main$`_gf_tmp_model` <- model_py
   n_params <- reticulate::py_to_r(
-    torch$tensor(
-      reticulate::py_eval(
-        "sum(p.numel() for p in model_py.parameters() if p.requires_grad)",
-        local = list(model_py = model_py))
-    )$item()
+    reticulate::py_eval(
+      "sum(p.numel() for p in _gf_tmp_model.parameters() if p.requires_grad)"
+    )
   )
+  main$`_gf_tmp_model` <- NULL
 
   result <- structure(
     list(
@@ -206,7 +220,14 @@ gf_train <- function(model,
   tr_i  <- idx[-seq_len(val_n)]
 
   to_tensor <- function(x, dtype = "float32") {
-    torch$tensor(reticulate::r_to_py(x), dtype = torch[[dtype]])$to(dev)
+    py_dtype <- switch(dtype,
+      "float32" = torch$float32,
+      "float64" = torch$float64,
+      "int64"   = torch$int64,
+      "int32"   = torch$int32,
+      torch$float32
+    )
+    torch$tensor(reticulate::r_to_py(x), dtype = py_dtype)$to(dev)
   }
 
   log_beta <- log(abs(pgs_weights) + 1e-8)
@@ -292,7 +313,7 @@ gf_load_model <- function(path, config = NULL, device = "auto") {
       config <- jsonlite::read_json(cfg_path)
     }
   }
-  args <- if (is.null(config)) list() else config
+  args <- if (is.null(config)) list() else .sanitise_config(config)
   model <- do.call(gf_build_model, c(args, list(device = device)))
   model$model_py$load_state_dict(.gf_env$torch$load(path))
   cli::cli_alert_success("Weights loaded from {.path {path}}")
@@ -301,6 +322,25 @@ gf_load_model <- function(path, config = NULL, device = "auto") {
 
 
 # ─── Internal helpers ──────────────────────────────────────────────────────────
+
+# Flatten any list-typed values produced by jsonlite::read_json() and coerce
+# each config field to the expected scalar type.
+.sanitise_config <- function(cfg) {
+  scalar <- function(x) if (is.list(x)) x[[1]] else x
+  list(
+    n_snps        = as.integer(scalar(cfg$n_snps)),
+    n_ld_blocks   = as.integer(scalar(cfg$n_ld_blocks)),
+    d_model       = as.integer(scalar(cfg$d_model)),
+    n_heads       = as.integer(scalar(cfg$n_heads)),
+    n_layers      = as.integer(scalar(cfg$n_layers)),
+    anc_dim       = as.integer(scalar(cfg$anc_dim)),
+    k_pops        = as.integer(scalar(cfg$k_pops)),
+    d_local       = as.integer(scalar(cfg$d_local)),
+    dropout       = as.numeric(scalar(cfg$dropout)),
+    use_local_anc = isTRUE(as.logical(scalar(cfg$use_local_anc)))
+  )
+}
+
 .resolve_device <- function(device) {
   if (device != "auto") return(device)
   torch <- .gf_env$torch
