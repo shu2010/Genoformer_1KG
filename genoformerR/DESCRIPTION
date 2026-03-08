@@ -6,13 +6,14 @@ Authors@R: person("Shu", role = c("aut", "cre"),
            email = "user@example.com")
 Description: R wrapper for GenoFormer — a transformer-based ancestry-aware
     polygenic risk scoring pipeline using 1000 Genomes Phase 3 as ancestry
-    reference. v0.3 provides a unified local ancestry dispatcher supporting
-    FLARE (Java, no pre-phasing required, recommended), RFMix2 (legacy,
-    requires SHAPEIT4 pre-phasing), and windowed PCA (pure R, no external
-    tools or reference panel). All methods produce a (N x M x K) per-SNP
-    posterior array for dual-level transformer conditioning: local ancestry
-    fused into each SNP token, global ancestry via FiLM at every block.
-    Python backend (PyTorch) managed via reticulate.
+    reference. v0.3.1 adds reference-based projection to gf_ancestry()
+    (fit PCA on 1KGP3, project external cohorts in) and gf_windowed_pca()
+    (three modes: reference-fit/project-study, study-only, project-into-saved),
+    plus gf_save_window_pcas() / gf_load_window_pcas() for consistent scoring
+    of new individuals. gf_run_pipeline() gains is_1kg_cohort= to select the
+    correct mode automatically and blocks the invalid FLARE+1KGP3 combination.
+    All local ancestry methods produce a (N x M x K) per-SNP posterior array
+    for dual-level transformer conditioning. Python backend via reticulate.
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true

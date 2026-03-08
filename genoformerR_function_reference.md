@@ -10,8 +10,13 @@ via the end-to-end `gf_run_pipeline()` wrapper.
 reference-based projection: PCA is fitted on a reference cohort (e.g. 1KGP3) and
 study or new-individual samples are projected into that fixed subspace. This is
 required for consistent ancestry inference when scoring individuals outside the
-training cohort. Three new functions support windowed PCA persistence:
-`gf_save_window_pcas()`, `gf_load_window_pcas()`.
+training cohort. `gf_save_window_pcas()` and `gf_load_window_pcas()` persist the
+per-window `prcomp` objects between training and scoring runs.
+
+`gf_run_pipeline()` gains `is_1kg_cohort=` and `ref_dosage_raw=` to select the
+correct ancestry mode automatically, a validation guard that blocks `"flare"` when
+`is_1kg_cohort=TRUE`, automatic `gf_save_model(save_config=TRUE)`, and automatic
+`gf_save_window_pcas()`. The FLARE + 1KGP3 incompatibility is documented throughout.
 
 ---
 
@@ -119,6 +124,15 @@ posteriors per sample per SNP. All downstream functions accept this array direct
 | `"flare"` | FLARE Java jar | No | Yes — 1KGP3 VCF | Yes — reference anchors K axes |
 | `"rfmix2"` | rfmix2 binary | Yes (SHAPEIT4) | Yes | Yes |
 | `"windowed_pca"` | pure R | No | Optional | Only with `ref_window_pcas=` |
+
+**FLARE and 1KGP3 training — incompatible.** When the training cohort IS 1KGP3
+(i.e. `gf_run_pipeline(is_1kg_cohort=TRUE)` or `genoformerR_build_model.R` with
+`IS_1KG_COHORT=TRUE`), FLARE must not be used. FLARE's emission probabilities are
+allele frequencies per population estimated from `ref_vcf`. When `ref_vcf` contains
+the same individuals as the query, those alleles are counted in the reference
+frequencies, biasing every emission probability. The resulting local ancestry
+posteriors are not valid — not just degraded, but structurally wrong. Use
+`"windowed_pca"` (Mode B) instead, then save `window_pcas.rds` for scoring time.
 
 ### `gf_local_ancestry_flare(vcf_file, ref_vcf, sample_map, gmap_dir, outdir, chroms, k_pops, flare_jar, java, min_maf, nthreads, em_its)`
 
@@ -255,7 +269,20 @@ Input tensor mapping:
 | `phenotype` | (B,) float32 | MSE + calibration loss |
 | `pop_labels` | (B,) int64 | CE auxiliary loss |
 
-`local_anc` is optional; if NULL, model trains in global-only mode.
+`local_anc` is optional; pass `NULL` to train in global-only mode (no
+`LocalAncestryProjector` MLP). When provided, K and its interpretation depend on
+the training scenario:
+
+- `IS_1KG_COHORT=TRUE` + `windowed_pca` (Mode B): K = `k_pops` pseudo-ancestry
+  dimensions from per-window PCA on 1KGP3. Axes have no named biological meaning.
+- `IS_1KG_COHORT=FALSE` + `windowed_pca` (Mode A): same shape; axes anchored to
+  1KGP3 reference structure via per-window reference projection.
+- `IS_1KG_COHORT=FALSE` + `flare`: K = number of named populations in `ref_panel`
+  (e.g. 5 for AFR/AMR/EAS/EUR/SAS). Each axis is a biological population.
+
+The LocalAncestryProjector MLP learns from whichever form is present at training
+time. Scoring-time `local_anc` must have the same K and the same semantic origin —
+mixing methods between training and scoring silently degrades ancestry conditioning.
 Returns `list(model, history)`.
 
 ---
@@ -303,10 +330,77 @@ Loads weights. If `config=NULL` auto-detects `_config.json` next to the `.pt` fi
 
 ## End-to-end pipeline
 
-### `gf_run_pipeline(..., local_anc_method)`
-Runs all stages in sequence. `local_anc_method`: `"flare"`, `"windowed_pca"`,
-`"rfmix2"`, or `"none"`. Returns named list: `ancestry`, `local_anc_arr`, `model`,
-`history`, `prs`, `evaluation`, `paths`.
+### `gf_run_pipeline(dosage_raw, pgs_file, panel_file, phenotype, outdir, is_1kg_cohort, ref_dosage_raw, local_anc_method, ...)`
+
+Runs all six stages in sequence. Saves all artefacts needed for scoring to `outdir`
+including `genoformer_best_config.json` (via `gf_save_model(save_config=TRUE)`) and
+`window_pcas.rds` (when `local_anc_method = "windowed_pca"`).
+
+**`is_1kg_cohort`** (logical, default `TRUE`) — the most important parameter.
+Controls whether global and local ancestry use study-only PCA (Mode B, `TRUE`) or
+reference-projection PCA (Mode A, `FALSE`). This distinction matters because:
+
+- When `TRUE`: the training cohort contains 1KGP3 samples whose IDs appear in the
+  panel file. PCA is fitted directly on `dosage_mat` for both global and windowed
+  local ancestry. No separate reference file needed.
+- When `FALSE`: the training cohort is an external study cohort whose IDs do not
+  appear in the panel file. `ref_dosage_raw=` (path to 1KGP3 `.raw` file) is
+  **required** to provide a reference PCA space.
+
+**`ref_dosage_raw`** (character or NULL) — path to the 1KGP3 LD-pruned `.raw` file.
+Required when `is_1kg_cohort = FALSE`. Used for both `gf_ancestry()` (global PCA
+reference) and `gf_windowed_pca()` (per-window reference). Ignored when
+`is_1kg_cohort = TRUE`.
+
+**`local_anc_method`** compatibility:
+
+| Method | `is_1kg_cohort=TRUE` | `is_1kg_cohort=FALSE` | Notes |
+|---|---|---|---|
+| `"flare"` | **Blocked — error** | Valid | Needs `vcf_file`, `ref_vcf`, `sample_map`, `gmap_dir` |
+| `"windowed_pca"` | Valid (Mode B) | Valid (Mode A) | Default; no external tools |
+| `"rfmix2"` | Not recommended | Valid | Requires pre-phasing |
+| `"none"` | Valid | Valid | Global-only baseline |
+
+FLARE is blocked when `is_1kg_cohort=TRUE` because 1KGP3 cannot serve as its own
+FLARE reference panel. FLARE's emission probabilities are per-population allele
+frequencies estimated from `ref_vcf`. When `ref_vcf` contains the same individuals
+as the query, those alleles contaminate the frequency estimates — the resulting local
+ancestry posteriors are invalid.
+
+```r
+# 1KGP3 base model — windowed PCA (IS_1KG_COHORT=TRUE)
+result <- gf_run_pipeline(
+  dosage_raw       = "data/kg3_qc.raw",
+  pgs_file         = "data/PGS000018.txt.gz",
+  panel_file       = "data/kg3.panel",
+  phenotype        = "data/phenotype.txt",
+  outdir           = "models/genoformer_v1",
+  is_1kg_cohort    = TRUE,
+  local_anc_method = "windowed_pca"  # "flare" would raise an error here
+)
+
+# External study cohort — FLARE (IS_1KG_COHORT=FALSE)
+result <- gf_run_pipeline(
+  dosage_raw       = "data/study_qc.raw",
+  pgs_file         = "data/PGS000018.txt.gz",
+  panel_file       = "data/kg3.panel",
+  phenotype        = "data/phenotype.txt",
+  outdir           = "models/genoformer_v1",
+  is_1kg_cohort    = FALSE,
+  ref_dosage_raw   = "data/kg3_pruned.raw",
+  local_anc_method = "flare",
+  vcf_file         = "data/study.vcf.gz",
+  ref_vcf          = "data/kg3_ref.vcf.gz",
+  sample_map       = "data/ref_panel.txt",
+  gmap_dir         = "data/genetic_maps",
+  flare_jar        = "tools/flare.jar"
+)
+```
+
+Returns named list: `ancestry`, `local_anc_arr`, `model`, `history`, `prs`,
+`evaluation`, `paths`. The `paths` element contains: `outdir`, `prs_csv`,
+`model_pt`, `model_config`, `ancestry_rds`, `window_pcas` (NULL if not windowed PCA),
+`history`.
 
 ---
 

@@ -5,6 +5,31 @@
 # Scores a new VCF file using a previously trained GenoFormer model.
 # Handles both global and local ancestry inference consistently with training.
 #
+# HOW TRAINING SCENARIO AFFECTS SCORING
+# ─────────────────────────────────────────────────────────────────────────────
+# The training script (genoformerR_build_model.R) has an IS_1KG_COHORT flag
+# that controls how ancestry was inferred during training. This determines what
+# methods are valid here at scoring time.
+#
+# IS_1KG_COHORT = TRUE (1KGP3 base model)
+#   Training used windowed PCA Mode B (no external reference).
+#   LOCAL_ANC_METHOD for scoring: "windowed_pca" or "flare".
+#     - "windowed_pca": uses Mode C — project into window_pcas.rds. The
+#       LocalAncestryProjector MLP was trained on windowed PCA K-vectors,
+#       so scoring must produce the same kind of input.
+#     - "flare": valid at scoring time (new individual is never in 1KGP3),
+#       BUT only if training also used FLARE. If training used windowed_pca,
+#       you must score with windowed_pca — the MLP learned from windowed PCA
+#       pseudo-ancestry dimensions, not FLARE's named-population posteriors.
+#
+# IS_1KG_COHORT = FALSE (external study cohort)
+#   Training used windowed PCA Mode A (projected into 1KGP3) or FLARE.
+#   LOCAL_ANC_METHOD for scoring must match training exactly.
+#     - "flare" training → "flare" scoring with the same ref_vcf + ref_panel
+#     - "windowed_pca" training → "windowed_pca" scoring with window_pcas.rds
+#
+# In all cases: set LOCAL_ANC_METHOD below to match what was used in training.
+#
 # PREREQUISITES — files produced during training (keep alongside the model)
 # ─────────────────────────────────────────────────────────────────────────────
 #   genoformer_best.pt            trained model weights
@@ -42,10 +67,17 @@ FLARE_JAR    <- "tools/flare.jar"               # FLARE only
 OUTDIR       <- "results/new_individual"
 PLINK2       <- "plink2"
 
-# LOCAL ANCESTRY METHOD — choose one:
-#   "flare"        recommended; unphased VCF accepted; needs Java + 1KGP3 ref
-#   "windowed_pca" pure R; uses saved per-window PCAs from training
-LOCAL_ANC_METHOD <- "flare"
+# LOCAL ANCESTRY METHOD — must match what was used during training.
+#
+#   "flare"        Valid when training used FLARE. Requires Java + 1KGP3 ref VCF.
+#                  Also valid as a first choice when IS_1KG_COHORT=TRUE was used
+#                  during training with windowed_pca — but only if training itself
+#                  used FLARE. Never mix methods between training and scoring.
+#
+#   "windowed_pca" Required when training used windowed_pca (IS_1KG_COHORT=TRUE
+#                  Mode B, or IS_1KG_COHORT=FALSE Mode A). Uses saved window_pcas.rds
+#                  to project into the training PC subspace (Mode C).
+LOCAL_ANC_METHOD <- "flare"   # set to match training: "flare" | "windowed_pca"
 
 fs::dir_create(OUTDIR)
 
@@ -129,11 +161,17 @@ pgs_weights[is.na(pgs_weights)] <- 0
 # STEP 5  Global ancestry — project into training reference space
 # =============================================================================
 # Load the saved gf_ancestry object from training.
-# This contains pca_obj (prcomp fitted on 1KGP3 reference in Mode A, or on
-# the full 1KGP3 cohort in Mode B) and clf_obj (trained Random Forest).
+# The pca_obj inside was fitted either on 1KGP3 directly (Mode B, when training
+# used IS_1KG_COHORT=TRUE) or on 1KGP3 as a reference with study samples
+# projected in (Mode A, IS_1KG_COHORT=FALSE). In both cases it is a prcomp
+# object whose rotation matrix defines a stable PC subspace.
 #
-# IMPORTANT: do NOT refit PCA on the new individual alone. The new individual
-# must be projected into the same PC axes used at training time.
+# stats::predict.prcomp applies the same centering vector and rotation to the
+# new individual's dosage values, placing them in the identical PC space used
+# during training. This works correctly for both Mode A and Mode B pca_obj.
+#
+# Never refit PCA on the new individual alone — a 1-sample PCA has no variance
+# to decompose and produces axes unrelated to the training subspace.
 
 anc_train <- readRDS(ANCESTRY_RDS)
 
@@ -177,12 +215,20 @@ cat(sprintf("Inferred population: %s (entropy = %.3f)\n",
 if (LOCAL_ANC_METHOD == "flare") {
 
   # ── FLARE ───────────────────────────────────────────────────────────────────
-  # Valid here because the new individual is NOT in 1KGP3, so using 1KGP3 as
-  # reference is correct. No saved artefacts from training are needed — FLARE's
-  # K dimensions are anchored to the reference populations in ref_panel.txt.
+  # A new individual is never in 1KGP3, so using 1KGP3 as the FLARE reference
+  # is always valid here — there is no emission-probability contamination.
   #
-  # The same ref_vcf and ref_panel used during training must be used here to
-  # ensure K and population ordering are identical.
+  # When to use FLARE here:
+  #   - Training used FLARE (IS_1KG_COHORT=FALSE + local_anc_method="flare")
+  #     → use same ref_vcf and ref_panel; FLARE's K population axes are
+  #       anchored to reference populations, consistency is automatic.
+  #   - Training used IS_1KG_COHORT=TRUE + local_anc_method="windowed_pca"
+  #     → do NOT use FLARE here; the model's LocalAncestryProjector MLP was
+  #       trained on windowed PCA K-vectors, not FLARE's named-population
+  #       posteriors. Set LOCAL_ANC_METHOD="windowed_pca" instead.
+  #
+  # The same ref_vcf and ref_panel used during training must be supplied so
+  # that K and population ordering are identical between training and scoring.
 
   flare_out <- gf_local_ancestry_flare(
     vcf_file   = NEW_VCF,
@@ -210,11 +256,19 @@ if (LOCAL_ANC_METHOD == "flare") {
 
   # ── Windowed PCA — Mode C (project into saved training window PCAs) ─────────
   # Load the per-window prcomp objects saved during training.
-  # gf_windowed_pca will project the new individual(s) into the same PC subspace
-  # used at training time via stats::predict.prcomp per window.
+  # gf_windowed_pca projects the new individual into the same PC subspace used
+  # at training time via stats::predict.prcomp per window (Mode C).
   #
-  # Do NOT call gf_windowed_pca without ref_window_pcas= here. Refitting PCA
-  # on a single individual produces degenerate output (all variances = 0).
+  # This is correct regardless of which training mode produced the window PCAs:
+  #   - IS_1KG_COHORT=TRUE (Mode B): PCAs were fitted on the 1KGP3 matrix.
+  #     Mode C reprojects into those 1KGP3-derived axes.
+  #   - IS_1KG_COHORT=FALSE (Mode A): PCAs were fitted on 1KGP3 as reference,
+  #     with study samples projected in. Mode C reprojects into those same axes.
+  # In both cases, window_pcas.rds is the bridge between training and scoring.
+  #
+  # Never call gf_windowed_pca without ref_window_pcas= at scoring time.
+  # Refitting per-window PCAs on a single sample produces degenerate output
+  # (zero variance per window, arbitrary axis orientations).
 
   if (!file.exists(WINDOW_PCAS))
     stop(paste(
@@ -354,26 +408,46 @@ cat(sprintf("Saved to: %s\n",
 # admixture_entropy
 #   Shannon entropy of soft ancestry probabilities. Near 0 = homogeneous
 #   continental ancestry; above ~0.5 = substantial admixture. Local ancestry
-#   conditioning (FLARE or windowed PCA) is most important for high-entropy
-#   (admixed) individuals.
+#   conditioning is most important for high-entropy (admixed) individuals.
 #
 # local_anc_available
 #   FALSE if local_anc was NULL and the model fell back to broadcasting global
-#   ancestry per-SNP. For admixed individuals, always ensure this is TRUE.
+#   ancestry per-SNP. For admixed individuals always ensure this is TRUE.
 #
-# CONSISTENCY REQUIREMENTS
 #
-# The following must be identical between training and scoring:
+# CONSISTENCY REQUIREMENTS — training vs scoring
+# ─────────────────────────────────────────────────────────────────────────────
 #
-#   Global ancestry   Use the saved pca_obj and clf_obj from ancestry.rds.
-#                     Never refit PCA on the new individual alone.
+# Global ancestry
+#   Always use the saved pca_obj and clf_obj from ancestry.rds.
+#   stats::predict.prcomp applies the training-time centering and rotation to
+#   new dosage values. This is correct whether the training pca_obj came from
+#   Mode A (1KGP3 reference projection) or Mode B (1KGP3 study-only PCA) —
+#   both produce a valid prcomp rotation matrix. Never refit PCA on a new
+#   individual alone.
 #
-#   Windowed PCA      Use ref_window_pcas= with the saved window_pcas.rds.
-#                     Never call gf_windowed_pca() without this argument when
-#                     scoring; refitting per-window PCAs on one sample produces
-#                     degenerate or arbitrary axes.
+# Local ancestry — windowed PCA
+#   Always use ref_window_pcas= with the saved window_pcas.rds (Mode C).
+#   Never call gf_windowed_pca() without this argument at scoring time.
+#   This applies whether training used Mode A (IS_1KG_COHORT=FALSE) or Mode B
+#   (IS_1KG_COHORT=TRUE) — the window_pcas.rds bridges both to Mode C.
 #
-#   FLARE             Use the same ref_vcf and ref_panel used during training.
-#                     FLARE's K dimensions are anchored to named populations,
-#                     so consistency is automatic as long as the reference is
-#                     unchanged.
+# Local ancestry — FLARE
+#   Use the same ref_vcf and ref_panel that were used during training.
+#   FLARE's K dimensions are anchored to named reference populations, so
+#   consistency is automatic as long as the reference is unchanged.
+#   FLARE cannot be used at scoring time if training used windowed_pca: the
+#   LocalAncestryProjector MLP was trained on windowed PCA K-vectors and
+#   expects inputs of that form, not FLARE's named-population posteriors.
+#
+# Method matching
+#   LOCAL_ANC_METHOD here must be identical to the method used during training.
+#   Mixing methods produces inputs the MLP was not trained on and silently
+#   degrades the transformer's ancestry conditioning.
+#   Training scenario → scoring method:
+#     IS_1KG_COHORT=TRUE  + windowed_pca → windowed_pca (Mode C)
+#     IS_1KG_COHORT=FALSE + windowed_pca → windowed_pca (Mode C)
+#     IS_1KG_COHORT=FALSE + flare        → flare (same ref_vcf + ref_panel)
+#     IS_1KG_COHORT=FALSE + rfmix2       → rfmix2 (same ref_vcf + ref_panel)
+#     IS_1KG_COHORT=TRUE  + none         → none (local_anc=NULL)
+#     IS_1KG_COHORT=FALSE + none         → none (local_anc=NULL)

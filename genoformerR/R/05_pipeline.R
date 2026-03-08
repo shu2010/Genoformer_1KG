@@ -26,8 +26,19 @@
 #' @param panel_file        Character. Path to 1KGP3 sample panel file.
 #' @param phenotype         Numeric vector or path to phenotype file (2-col: ID, pheno).
 #' @param outdir            Character. Output directory. Default \code{"genoformer_out"}.
-#' @param local_anc_method  Character. One of \code{"flare"} (default),
-#'   \code{"rfmix2"}, \code{"windowed_pca"}, or \code{"none"}.
+#' @param is_1kg_cohort     Logical. TRUE when \code{dosage_raw} contains 1KGP3
+#'   samples (base-model training scenario). FALSE for any external study cohort.
+#'   Controls whether global and local ancestry use study-only PCA (Mode B,
+#'   TRUE) or reference-projection PCA (Mode A, FALSE). When TRUE,
+#'   \code{"flare"} is blocked because 1KGP3 cannot serve as its own FLARE
+#'   reference panel. Default \code{TRUE}.
+#' @param ref_dosage_raw    Character or NULL. Path to 1KGP3 LD-pruned \code{.raw}
+#'   file for reference-based global ancestry projection. Required when
+#'   \code{is_1kg_cohort = FALSE}. Ignored when \code{is_1kg_cohort = TRUE}.
+#' @param local_anc_method  Character. One of \code{"flare"} (default for
+#'   external cohorts), \code{"rfmix2"}, \code{"windowed_pca"}, or
+#'   \code{"none"}. \code{"flare"} is only valid when
+#'   \code{is_1kg_cohort = FALSE}.
 #' @param vcf_file          Character or NULL. Study VCF (unphased for FLARE;
 #'   phased for RFMix2). Required for \code{"flare"} and \code{"rfmix2"}.
 #' @param ref_vcf           Character or NULL. Reference panel VCF. Required for
@@ -80,7 +91,9 @@ gf_run_pipeline <- function(dosage_raw,
                              panel_file,
                              phenotype,
                              outdir           = "genoformer_out",
-                             local_anc_method = c("flare", "windowed_pca",
+                             is_1kg_cohort    = TRUE,
+                             ref_dosage_raw   = NULL,
+                             local_anc_method = c("windowed_pca", "flare",
                                                    "rfmix2", "none"),
                              vcf_file         = NULL,
                              ref_vcf          = NULL,
@@ -102,18 +115,17 @@ gf_run_pipeline <- function(dosage_raw,
   fs::dir_create(outdir)
   t0 <- proc.time()
 
-  # ── Mode banner ─────────────────────────────────────────────────────────────
-  mode_label <- c(
-    flare        = "FLARE (no phasing required)",
-    rfmix2       = "RFMix2 (legacy, requires phasing)",
-    windowed_pca = "Windowed PCA (pure R, no reference panel)",
-    none         = "Global-only (no local ancestry)"
-  )
-  cli::cli_h1("GenoFormer v0.3 Pipeline")
-  cli::cli_alert_info("Local ancestry: {.strong {mode_label[local_anc_method]}}")
+  # ── Validate is_1kg_cohort / method combination ──────────────────────────────
+  if (is_1kg_cohort && local_anc_method == "flare")
+    cli::cli_abort(c(
+      "local_anc_method='flare' is incompatible with is_1kg_cohort=TRUE.",
+      "i" = "FLARE requires an independent reference panel.",
+      "i" = "When the training cohort IS 1KGP3, using 1KGP3 as both query and",
+      "i" = "reference contaminates FLARE's allele frequency emission estimates.",
+      "i" = "Use local_anc_method='windowed_pca' or 'none' for 1KGP3 base-model training."
+    ))
 
-  # ── Validate method-specific inputs ─────────────────────────────────────────
-  if (local_anc_method %in% c("flare", "rfmix2")) {
+  if (!is_1kg_cohort && local_anc_method %in% c("flare", "rfmix2")) {
     missing_args <- names(Filter(is.null,
       list(vcf_file = vcf_file, ref_vcf = ref_vcf,
            sample_map = sample_map, gmap_dir = gmap_dir)))
@@ -122,6 +134,24 @@ gf_run_pipeline <- function(dosage_raw,
         "local_anc_method='{local_anc_method}' requires: {paste(missing_args, collapse=', ')}"
       )
   }
+
+  if (!is_1kg_cohort && is.null(ref_dosage_raw))
+    cli::cli_abort(c(
+      "ref_dosage_raw= is required when is_1kg_cohort=FALSE.",
+      "i" = "Supply the path to the 1KGP3 LD-pruned .raw file so that PCA is",
+      "i" = "fitted on 1KGP3 and external samples are projected into that space."
+    ))
+
+  # ── Mode banner ─────────────────────────────────────────────────────────────
+  mode_label <- c(
+    flare        = "FLARE (no phasing required)",
+    rfmix2       = "RFMix2 (legacy, requires phasing)",
+    windowed_pca = "Windowed PCA (pure R)",
+    none         = "Global-only (no local ancestry)"
+  )
+  cli::cli_h1("GenoFormer v0.3.1 Pipeline")
+  cli::cli_alert_info("Cohort: {.strong {if (is_1kg_cohort) '1KGP3 base model' else 'External study cohort'}}")
+  cli::cli_alert_info("Local ancestry: {.strong {mode_label[local_anc_method]}}")
 
   # ── 0. Python backend ────────────────────────────────────────────────────────
   gf_init()
@@ -154,9 +184,15 @@ gf_run_pipeline <- function(dosage_raw,
   stopifnot(length(phenotype) == length(sample_ids))
 
   # ── 2. Global ancestry ────────────────────────────────────────────────────────
+  # is_1kg_cohort=TRUE  → Mode B: dosage_mat IS 1KGP3, IDs match panel directly.
+  # is_1kg_cohort=FALSE → Mode A: project external samples into 1KGP3 PC space.
   cli::cli_alert_info("[2/6] Inferring global ancestry...")
-  anc <- gf_ancestry(dosage_mat = dosage_mat, panel_file = panel_file,
-                     method = ancestry_method)
+  anc <- gf_ancestry(
+    dosage_mat     = dosage_mat,
+    panel_file     = panel_file,
+    ref_dosage_raw = if (is_1kg_cohort) NULL else ref_dosage_raw,
+    method         = ancestry_method
+  )
   saveRDS(anc, file.path(outdir, "ancestry.rds"))
 
   # ── 3. Local ancestry ─────────────────────────────────────────────────────────
@@ -217,11 +253,25 @@ gf_run_pipeline <- function(dosage_raw,
     )
 
   } else if (local_anc_method == "windowed_pca") {
+    # is_1kg_cohort=TRUE  → Mode B: study-only PCA on the 1KGP3 matrix directly.
+    #   Do NOT pass ref_dosage_mat=; dosage_mat IS 1KGP3 so reference == study.
+    # is_1kg_cohort=FALSE → Mode A: fit per-window PCA on 1KGP3 reference,
+    #   project external samples in. Load ref from ref_dosage_raw.
+    if (!is_1kg_cohort) {
+      ref_raw_wp    <- data.table::fread(ref_dosage_raw, nThread = 4L)
+      ref_dosage_wp <- as.matrix(ref_raw_wp[, -(1:6)])
+      ref_dosage_wp[is.na(ref_dosage_wp)] <- 0
+      storage.mode(ref_dosage_wp) <- "numeric"
+    }
     local_anc_arr <- gf_windowed_pca(
-      dosage_mat = dosage_mat,
-      snp_chroms = chroms_snp,
-      k_pops     = k_pops
+      dosage_mat     = dosage_mat,
+      snp_chroms     = chroms_snp,
+      ref_dosage_mat = if (is_1kg_cohort) NULL else ref_dosage_wp,
+      k_pops         = k_pops
     )
+    # Save per-window prcomp objects — required to score new individuals later
+    gf_save_window_pcas(local_anc_arr,
+                         file.path(outdir, "window_pcas.rds"))
 
   } else {
     cli::cli_alert_info("Local ancestry skipped — global-only conditioning.")
@@ -264,6 +314,10 @@ gf_run_pipeline <- function(dosage_raw,
     train_config
   ))
   model <- trained$model
+  # Save weights + architecture config — both files are needed by gf_load_model()
+  gf_save_model(model,
+                path        = file.path(outdir, "genoformer_best.pt"),
+                save_config = TRUE)
   write.csv(trained$history, file.path(outdir, "training_history.csv"),
             row.names = FALSE)
 
@@ -302,10 +356,14 @@ gf_run_pipeline <- function(dosage_raw,
     prs           = prs,
     evaluation    = eval_res,
     paths         = list(
-      outdir    = outdir,
-      prs_csv   = file.path(outdir, "prs_scores.csv"),
-      model_pt  = file.path(outdir, "genoformer_best.pt"),
-      history   = file.path(outdir, "training_history.csv")
+      outdir       = outdir,
+      prs_csv      = file.path(outdir, "prs_scores.csv"),
+      model_pt     = file.path(outdir, "genoformer_best.pt"),
+      model_config = file.path(outdir, "genoformer_best_config.json"),
+      ancestry_rds = file.path(outdir, "ancestry.rds"),
+      window_pcas  = if (local_anc_method == "windowed_pca")
+                       file.path(outdir, "window_pcas.rds") else NULL,
+      history      = file.path(outdir, "training_history.csv")
     )
   )
 }

@@ -173,14 +173,26 @@ pop_int <- as.integer(factor(study_pop_labels, levels = POP_NAMES)) - 1L
 
 
 # =============================================================================
-# STEP 3  Local ancestry — windowed PCA with reference projection
+# STEP 3  Local ancestry — windowed PCA across training scenarios
 # =============================================================================
+# We demonstrate all three windowed PCA modes and both training scenarios:
+#
+#   Scenario A — IS_1KG_COHORT=FALSE (external study cohort)
+#     3a. Mode A: fit per-window PCAs on reference, project study samples in
+#     3b. Mode C: project new individual into saved training window PCAs
+#
+#   Scenario B — IS_1KG_COHORT=TRUE (1KGP3 base model)
+#     3c. Mode B: fit per-window PCAs on the 1KGP3 matrix directly (no ref)
+#         FLARE is invalid in this scenario — demonstrated in Step 8
+#
+#   3d. Unified dispatcher
 cat("\n── Step 3: Windowed PCA local ancestry ──\n")
 
-# ── 3a. Training run — Mode A (reference-based) ─────────────────────────────
+# ── 3a. IS_1KG_COHORT=FALSE — Mode A (reference-based) ──────────────────────
 # Fit per-window PCAs on the reference cohort, project study samples in.
 # This ensures window PC axes are stable and anchored to the reference population
 # structure regardless of what study samples are present.
+# Corresponds to IS_1KG_COHORT=FALSE in genoformerR_build_model.R.
 
 local_anc_arr <- gf_windowed_pca(
   dosage_mat     = study_dosage,
@@ -199,7 +211,7 @@ row_sums <- apply(local_anc_arr, c(1, 2), sum)
 cat(sprintf("Row sums: min=%.6f  max=%.6f (expect ~1)\n",
             min(row_sums), max(row_sums)))
 
-# Save window PCAs — REQUIRED for scoring new individuals later
+# Save window PCAs — REQUIRED for scoring new individuals later (Mode C)
 wpca_rds_path <- tempfile(fileext = ".rds")
 gf_save_window_pcas(local_anc_arr, wpca_rds_path)
 
@@ -236,8 +248,48 @@ cat(sprintf("New individual local ancestry dims: [%s]\n",
             paste(dim(la_new_ind), collapse = " x ")))
 
 
-# ── 3c. Unified dispatcher ───────────────────────────────────────────────────
-cat("\n── Unified dispatcher (gf_local_ancestry) ──\n")
+# ── 3c. IS_1KG_COHORT=TRUE — Mode B (study-only, no reference) ───────────────
+# When training cohort IS 1KGP3, no separate reference is needed or valid.
+# PCA is fitted directly on dosage_mat (2504-sample 1KGP3; well-conditioned).
+# FLARE cannot be used in this scenario — 1KGP3 cannot be both the query and
+# the reference panel simultaneously (emission probability contamination).
+# This corresponds to IS_1KG_COHORT=TRUE in genoformerR_build_model.R.
+# Here we use ref_dosage (our 1KGP3 stand-in) as the training cohort.
+
+cat("\n── 3c. IS_1KG_COHORT=TRUE — Mode B (1KGP3 base model, no reference) ──\n")
+
+la_1kg_modeB <- gf_windowed_pca(
+  dosage_mat  = ref_dosage,       # ref_dosage IS the training cohort here
+  snp_chroms  = snp_chroms,
+  # ref_dosage_mat NOT passed — dosage_mat is 1KGP3 itself (Mode B)
+  k_pops      = 5L,
+  window_size = 50L,
+  step_size   = 25L
+)
+cat(sprintf("Mode B dims: [%s]\n",
+            paste(dim(la_1kg_modeB), collapse = " x ")))
+
+rs_b <- apply(la_1kg_modeB, c(1,2), sum)
+cat(sprintf("Row sums: min=%.6f  max=%.6f\n", min(rs_b), max(rs_b)))
+
+# Save Mode B window PCAs — used exactly like Mode A at scoring time (Mode C)
+wpca_1kg_path <- tempfile(fileext = ".rds")
+gf_save_window_pcas(la_1kg_modeB, wpca_1kg_path)
+cat("Mode B window PCAs saved. Scoring new individuals uses Mode C identically.\n")
+
+# Demonstrate Mode C on the same new individual using Mode B window PCAs
+ref_pcas_1kg   <- gf_load_window_pcas(wpca_1kg_path)
+la_new_modeC_1kg <- gf_windowed_pca(
+  dosage_mat      = new_ind_dosage,
+  snp_chroms      = snp_chroms,
+  ref_window_pcas = ref_pcas_1kg  # Mode C — project into Mode B training axes
+)
+cat(sprintf("New individual via Mode C (from Mode B training): [%s]\n",
+            paste(dim(la_new_modeC_1kg), collapse = " x ")))
+
+
+# ── 3d. Unified dispatcher ───────────────────────────────────────────────────
+cat("\n── 3d. Unified dispatcher (gf_local_ancestry) ──\n")
 la_via_dispatcher <- gf_local_ancestry(
   method         = "windowed_pca",
   dosage_mat     = study_dosage,
@@ -303,7 +355,8 @@ if (python_ok) {
     chroms       = snp_chroms,
     phenotype    = phenotype,
     pop_labels   = pop_int,
-    local_anc    = local_anc_arr,   # (N x M x K) from windowed PCA Mode A
+    local_anc    = local_anc_arr,   # (N x M x K) from Mode A windowed PCA (Step 3a)
+                                    # IS_1KG_COHORT=TRUE would pass la_1kg_modeB here
     epochs       = 10L,
     batch_size   = 32L,
     lr           = 1e-3,
@@ -435,7 +488,7 @@ la_overlap <- gf_windowed_pca(
 cat(sprintf("Overlapping windows dims: [%s]\n",
             paste(dim(la_overlap), collapse=" x ")))
 
-# 8b. Demonstrate gf_save_window_pcas error when attribute is missing
+# 8b. gf_save_window_pcas error when attribute is missing
 cat("\ngf_save_window_pcas on array without attribute (expect error):\n")
 arr_no_attr <- la_overlap
 attr(arr_no_attr, "window_pcas") <- NULL
@@ -451,7 +504,24 @@ tryCatch(
   error = function(e) cat("Expected error:", conditionMessage(e), "\n")
 )
 
-# 8d. Internal SNP metadata helpers
+# 8d. gf_run_pipeline rejects FLARE when is_1kg_cohort=TRUE
+# This demonstrates the validation guard added in v0.3.1.
+# When the training cohort IS 1KGP3, FLARE cannot be used because 1KGP3
+# cannot serve as its own reference panel (emission probability contamination).
+cat("\ngf_run_pipeline IS_1KG_COHORT=TRUE + FLARE validation error:\n")
+tryCatch(
+  gf_run_pipeline(
+    dosage_raw       = "data/kg3.raw",
+    pgs_file         = "data/PGS000018.txt.gz",
+    panel_file       = "data/kg3.panel",
+    phenotype        = "data/phenotype.txt",
+    is_1kg_cohort    = TRUE,
+    local_anc_method = "flare"       # blocked: FLARE requires independent reference
+  ),
+  error = function(e) cat("Expected error:", conditionMessage(e), "\n")
+)
+
+# 8e. Internal SNP metadata helpers
 cat("\nInternal SNP helpers:\n")
 test_ids <- c("chr1_1000_A_T", "chr3_5000_G_C", "chr5_99000_T_A")
 cat("  chromosomes:", paste(genoformerR:::.snp_chroms(test_ids),    collapse=" "), "\n")
