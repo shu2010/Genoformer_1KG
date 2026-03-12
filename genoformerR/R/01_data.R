@@ -68,6 +68,7 @@ gf_download_1kg <- function(outdir      = "data/1kg",
 #' scoring file.
 #'
 #' @param vcf_dir   Character. Directory containing per-chromosome VCFs.
+#' @param vcf_fil   Character. merged VCF file input
 #' @param pgs_file  Character. Path to PGS Catalog scoring file (.txt.gz).
 #' @param outdir    Character. Output directory for pgen files.
 #' @param maf       Numeric. Minor allele frequency threshold. Default 0.01.
@@ -84,7 +85,8 @@ gf_download_1kg <- function(outdir      = "data/1kg",
 #'   \code{n_snps_qc}, \code{n_snps_pgs}.
 #' @export
 gf_qc <- function(vcf_dir,
-                   pgs_file,
+                   vcf_fil,
+		   pgs_file,
                    outdir    = "data/plink",
                    maf       = 0.01,
                    hwe       = 1e-6,
@@ -100,7 +102,14 @@ gf_qc <- function(vcf_dir,
   .check_plink2(plink2)
 
   cli::cli_h1("Genotype QC Pipeline")
-
+if (is.null(vcf_dir)) {
+        merged <- file.path(outdir, "kg3_merged")
+        .run_plink2(plink2, "--vcf", vcf_fil, "--make-pgen",
+            "--out", merged, "--max-alleles", "2", "--import-max-alleles",
+            "255", "--rm-dup", "exclude-all", "--silent", "--chr",
+ "1-22")
+    }
+    else {
   # ── Step 1: VCF → pgen per chromosome ────────────────────────────────────
   cli::cli_alert_info("Converting VCFs to PLINK2 format...")
   merge_list <- character(0)
@@ -124,6 +133,7 @@ gf_qc <- function(vcf_dir,
   merged  <- file.path(outdir, "kg3_merged")
   .run_plink2(plink2, "--pmerge-list", ml_file, "pfile",
               "--make-pgen", "--out", merged, "--silent")
+}
 
   # ── Step 3: QC ───────────────────────────────────────────────────────────
   cli::cli_alert_info("Applying QC filters (MAF={maf}, HWE={hwe}, geno={geno_miss})...")
@@ -135,6 +145,8 @@ gf_qc <- function(vcf_dir,
     "--geno", geno_miss,
     "--mind", mind_miss,
     "--make-pgen", "--out", qc_out,
+    "--set-all-var-ids", "@:#:\\$r:\\$a",
+    "--new-id-max-allele-len", "1000",
     "--silent"
   )
 
@@ -143,7 +155,7 @@ gf_qc <- function(vcf_dir,
   prune_out <- file.path(outdir, "pruned_snps")
   .run_plink2(plink2, "--pfile", qc_out,
     "--indep-pairwise", ld_window, ld_step, ld_r2,
-    "--out", prune_out, "--silent")
+    "--out", prune_out,"--rm-dup", "--silent")
   pruned_out <- file.path(outdir, "kg3_pruned")
   .run_plink2(plink2, "--pfile", qc_out,
     "--extract", paste0(prune_out, ".prune.in"),
@@ -199,8 +211,12 @@ gf_qc <- function(vcf_dir,
 .intersect_pgs <- function(pgs_file, pvar_file) {
   pgs  <- data.table::fread(pgs_file, skip = "#", nThread = 2L)
   pvar <- data.table::fread(pvar_file, nThread = 2L)
+  pvar_ID = unlist(lapply(strsplit(pvar$ID, split=":"), function(x)paste(x[1], x[2], sep=":")))
+  pgs$id = paste(pgs$hm_chr, pgs$hm_pos, sep=":")
+  pvar_pgs = pvar$ID[pvar_ID %in% pgs$id]
+  return(pvar_pgs)
   # Try rsID column names used by PGS Catalog
-  id_col <- intersect(c("rsID", "variant_id", "ID", "snp"), names(pgs))[1]
-  if (is.na(id_col)) cli::cli_abort("Cannot find variant ID column in PGS file.")
-  intersect(pgs[[id_col]], pvar$ID)
+  # id_col <- intersect(c("rsID", "variant_id", "ID", "snp"), names(pgs))[1]
+  # if (is.na(id_col)) cli::cli_abort("Cannot find variant ID column in PGS file.")
+  # intersect(pgs[[id_col]], pvar$ID)
 }
